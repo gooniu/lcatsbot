@@ -1,10 +1,12 @@
-/*
+/******************************************************
  * Discord Bot Maker Bot
- * Version 2.0.1
+ * Version 1.5.10
  * Robert Borghese
- */
+ ******************************************************/
 
 const DBM = {};
+DBM.version = "1.5.10";
+
 const DiscordJS = DBM.DiscordJS = require('discord.js');
 
 //---------------------------------------------------------------------
@@ -24,6 +26,7 @@ Bot.bot = null;
 
 Bot.init = function() {
 	this.initBot();
+	this.setupBot();
 	this.reformatData();
 	this.initEvents();
 	this.login();
@@ -32,6 +35,29 @@ Bot.init = function() {
 Bot.initBot = function() {
 	this.bot = new DiscordJS.Client();
 };
+
+Bot.setupBot = function() {
+	this.bot.on('raw', this.onRawData);
+};
+
+Bot.onRawData = function(packet) {
+	if(packet.t !== "MESSAGE_REACTION_ADD" || packet.t !== "MESSAGE_REACTION_REMOVE") return;
+
+	const client = Bot.bot;
+	const channel = client.channels.get(packet.d.channel_id);
+	if(channel.messages.has(packet.d.message_id)) return;
+
+	channel.fetchMessage(packet.d.message_id).then(function(message) {
+		const emoji = packet.d.emoji.id ? `${packet.d.emoji.name}:${packet.d.emoji.id}` : packet.d.emoji.name;
+		const reaction = message.reactions.get(emoji);
+		if (packet.t === 'MESSAGE_REACTION_ADD') {
+			client.emit('messageReactionAdd', reaction, client.users.get(packet.d.user_id));
+		}
+		if (packet.t === 'MESSAGE_REACTION_REMOVE') {
+			client.emit('messageReactionRemove', reaction, client.users.get(packet.d.user_id));
+		}
+	});
+}
 
 Bot.reformatData = function() {
 	this.reformatCommands();
@@ -104,7 +130,7 @@ Bot.login = function() {
 
 Bot.onReady = function() {
 	if(process.send) process.send('BotReady');
-	console.log('Bot is ready!');
+	console.log('Bot is ready!'); // Tells editor to start!
 	this.restoreVariables();
 	this.preformInitialization();
 };
@@ -230,7 +256,9 @@ Bot.checkRegExps = function(msg) {
 
 const Actions = DBM.Actions = {};
 
-Actions.location = null;
+Actions.actionsLocation = null;
+Actions.eventsLocation = null;
+Actions.extensionsLocation = null;
 
 Actions.server = {};
 Actions.global = {};
@@ -319,20 +347,35 @@ Actions.evalMessage = function(content, cache) {
 
 Actions.initMods = function() {
 	const fs  = require('fs');
-	fs.readdirSync(this.location).forEach(function(file) {
-		if(file.match(/\.js/i)) {
-			const action = require(require('path').join(this.location, file));
-			this[action.name] = action.action;
-			if(action.mod) {
-				try {
-					action.mod(DBM);
-				} catch(e) {
-					console.error(e);
+	this.modDirectories().forEach(function(dir) {
+		fs.readdirSync(dir).forEach(function(file) {
+			if(file.match(/\.js/i)) {
+				const action = require(require('path').join(dir, file));
+				if(action.action) {
+					this[action.name] = action.action;
+				}
+				if(action.mod) {
+					try {
+						action.mod(DBM);
+					} catch(e) {
+						console.error(e);
+					}
 				}
 			}
-		}
+		}.bind(this));
 	}.bind(this));
 };
+
+Actions.modDirectories = function() {
+	const result = [this.actionsLocation];
+	if(Files.verifyDirectory(Actions.eventsLocation)) {
+		result.push(this.eventsLocation);
+	}
+	if(Files.verifyDirectory(Actions.extensionsLocation)) {
+		result.push(this.extensionsLocation);
+	}
+	return result;
+}
 
 Actions.preformActions = function(msg, cmd) {
 	if(this.checkConditions(msg, cmd) && this.checkTimeRestriction(msg, cmd)) {
@@ -438,14 +481,14 @@ Actions.checkPermissions = function(msg, permissions) {
 Actions.invokeActions = function(msg, actions) {
 	const act = actions[0];
 	if(!act) return;
+	const cache = {
+		actions: actions,
+		index: 0,
+		temp: {},
+		server: msg.guild,
+		msg: msg
+	};
 	if(this.exists(act.name)) {
-		const cache = {
-			actions: actions,
-			index: 0,
-			temp: {},
-			server: msg.guild,
-			msg: msg
-		}
 		try {
 			this[act.name](cache);
 		} catch(e) {
@@ -453,6 +496,7 @@ Actions.invokeActions = function(msg, actions) {
 		}
 	} else {
 		console.error(act.name + " does not exist!");
+		this.callNextAction(cache);
 	}
 };
 
@@ -460,13 +504,13 @@ Actions.invokeEvent = function(event, server, temp) {
 	const actions = event.actions;
 	const act = actions[0];
 	if(!act) return;
+	const cache = {
+		actions: actions,
+		index: 0,
+		temp: temp,
+		server: server
+	};
 	if(this.exists(act.name)) {
-		const cache = {
-			actions: actions,
-			index: 0,
-			temp: temp,
-			server: server
-		}
 		try {
 			this[act.name](cache);
 		} catch(e) {
@@ -474,6 +518,7 @@ Actions.invokeEvent = function(event, server, temp) {
 		}
 	} else {
 		console.error(act.name + " does not exist!");
+		this.callNextAction(cache);
 	}
 };
 
@@ -496,6 +541,7 @@ Actions.callNextAction = function(cache) {
 		}
 	} else {
 		console.error(act.name + " does not exist!");
+		this.callNextAction(cache);
 	}
 };
 
@@ -1095,22 +1141,32 @@ Files.dataFiles = [
 Files.startBot = function() {
 	const fs = require('fs');
 	const path = require('path');
+	/*
 	if(process.env['IsDiscordBotMakerTest'] === 'true') {
 		Actions.location = process.env['ActionsDirectory'];
 		this.initBotTest();
 	} else if(process.argv.length >= 3 && fs.existsSync(process.argv[2])) {
 		Actions.location = process.argv[2];
 	} else {
-		Actions.location = path.join(process.cwd(), 'actions')
+		Actions.location = path.join(__dirname, 'actions');
 	}
-	if(typeof Actions.location === 'string' && fs.existsSync(Actions.location)) {
+	*/
+	Actions.actionsLocation = path.join(__dirname, 'actions');
+	Actions.eventsLocation = path.join(__dirname, 'events');
+	Actions.extensionsLocation = path.join(__dirname, 'extensions');
+	if(this.verifyDirectory(Actions.actionsLocation)) {
 		Actions.initMods();
 		this.readData(Bot.init.bind(Bot));
 	} else {
-		console.error('Please copy the "Actions" folder from the Discord Bot Maker directory to this bot\'s directory: \n' + Actions.location);
+		console.error('Please copy the "Actions" folder from the Discord Bot Maker directory to this bot\'s directory: \n' + Actions.actionsLocation);
 	}
 };
 
+Files.verifyDirectory = function(dir) {
+	return typeof dir === 'string' && require('fs').existsSync(dir);
+}
+
+/*
 Files.initBotTest = function(content) {
 	this._console_log = console.log;
 	console.log = function() {
@@ -1124,6 +1180,7 @@ Files.initBotTest = function(content) {
 		Files._console_error.apply(this, arguments);
 	};
 };
+*/
 
 Files.readData = function(callback) {
 	const fs = require('fs');
@@ -1304,6 +1361,8 @@ Files.restoreValue = function(value, bot) {
 					}
 				});
 			}
+		} else {
+			resolve(value);
 		}
 	}.bind(this));
 };
@@ -1439,6 +1498,7 @@ Audio.clearQueue = function(cache) {
 Audio.playNext = function(id, forceSkip) {
 	if(!this.connections[id]) return;
 	if(!this.dispatchers[id] || !!forceSkip) {
+		if(!this.queue[id]) this.queue[id] = [];
 		if(this.queue[id].length > 0) {
 			const item = this.queue[id].shift();
 			this.playItem(item, id);
@@ -1575,7 +1635,7 @@ Guild.prototype.getDefaultChannel = function() {
 	let channel = this.channels.get(this.id);
 	if(!channel) {
 		this.channels.array().forEach(function(c) {
-			if(c.type !== 'voice') {
+			if(c.permissionsFor(DBM.Bot.bot.user).has('SEND_MESSAGES') && c.type !== 'voice' && c.type !== 'category') {
 				if(!channel) {
 					channel = c;
 				} else if(channel.position > c.position) {
